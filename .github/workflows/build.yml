@@ -136,6 +136,7 @@ jobs:
             -e DB_PASSWORD=smoke \
             -e AUTH_TYPE=scram-sha-256 \
             -e POOL_MODE=transaction \
+            -e LISTEN_PORT=6432 \
             edoburu/pgbouncer@sha256:4c1ca296ef525f108f5d3552cc337c0c09587cf8dae7f0067fd93349e47dc1cd
 
           for _ in $(seq 1 60); do
