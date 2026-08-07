@@ -139,14 +139,15 @@ jobs:
             -e LISTEN_PORT=6432 \
             edoburu/pgbouncer@sha256:4c1ca296ef525f108f5d3552cc337c0c09587cf8dae7f0067fd93349e47dc1cd
 
+          # The client runs inside the already-started server container: this image's
+          # entrypoint is wrapper.sh, so using it standalone tries to boot a server.
           for _ in $(seq 1 60); do
-            docker run --rm --network smokenet -e PGPASSWORD=smoke "$IMAGE" \
-              pg_isready -h pgbouncer -p 6432 -U postgres -q 2>/dev/null && break
+            docker exec smoke pg_isready -h pgbouncer -p 6432 -U postgres -q 2>/dev/null && break
             sleep 2
           done
 
           pooled() {
-            docker run --rm --network smokenet -e PGPASSWORD=smoke "$IMAGE" \
+            docker exec -e PGPASSWORD=smoke smoke \
               psql -h pgbouncer -p 6432 -U postgres -d postgres -X -tAc "$1"
           }
           echo "through pgbouncer: $(pooled "select version()" | cut -c1-40)"
