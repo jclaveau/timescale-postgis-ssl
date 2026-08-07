@@ -2,6 +2,16 @@ name: Docker Image CI/CD for timescale + postgis image
 
 on:
   workflow_dispatch:
+  pull_request:
+    paths:
+      - "Dockerfile.*"
+      - "init-ssl.sh"
+      - "wrapper.sh"
+      - ".github/workflows/build.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build:
@@ -57,5 +67,7 @@ jobs:
         with:
           file: ${{ matrix.dockerfile }}
           platforms: linux/amd64
-          push: true
+          # A pull request builds to prove the Dockerfile resolves, and stops short of
+          # overwriting a published tag with an unreviewed branch.
+          push: ${{ github.event_name != 'pull_request' }}
           tags: ghcr.io/${{ github.repository }}:${{ steps.extract_version.outputs.version }}
