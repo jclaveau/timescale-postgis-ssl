@@ -62,12 +62,64 @@ jobs:
           echo "version=${version}" >> "$GITHUB_OUTPUT"
         shell: bash
 
-      - name: Build and Publish
+      - name: Build
         uses: docker/build-push-action@v6
         with:
           file: ${{ matrix.dockerfile }}
           platforms: linux/amd64
-          # A pull request builds to prove the Dockerfile resolves, and stops short of
-          # overwriting a published tag with an unreviewed branch.
-          push: ${{ github.event_name != 'pull_request' }}
+          load: true
+          push: false
           tags: ghcr.io/${{ github.repository }}:${{ steps.extract_version.outputs.version }}
+
+      - name: Smoke test
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}:${{ steps.extract_version.outputs.version }}
+          VERSION: ${{ steps.extract_version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          expected_pg="${VERSION%%-*}"; expected_pg="${expected_pg#pg}"
+          expected_ts="${VERSION#*-ts}"
+
+          # PGDATA is mandatory: wrapper.sh exits 1 without it. Same path Railway mounts,
+          # so init-ssl.sh writes its certs beside the data directory as it does in prod.
+          docker run -d --name smoke \
+            -e POSTGRES_PASSWORD=smoke \
+            -e PGDATA=/var/lib/postgresql/data/pgdata \
+            "$IMAGE"
+
+          for _ in $(seq 1 90); do
+            docker exec smoke pg_isready -U postgres -q 2>/dev/null && break
+            sleep 2
+          done
+          docker exec smoke pg_isready -U postgres
+
+          q() { docker exec smoke psql -U postgres -X -tAc "$1"; }
+
+          actual_pg=$(q "select current_setting('server_version_num')::int / 10000")
+          echo "postgres major: $actual_pg (expected $expected_pg)"
+          test "$actual_pg" = "$expected_pg"
+
+          # Proves the tag is not lying about what it ships, which is the failure this
+          # workflow exists to catch: filename and base tag drifting apart.
+          q "create extension if not exists timescaledb" >/dev/null
+          actual_ts=$(q "select extversion from pg_extension where extname = 'timescaledb'")
+          echo "timescaledb: $actual_ts (expected ${expected_ts}.x)"
+          case "$actual_ts" in "${expected_ts}."*) ;; *) exit 1 ;; esac
+
+          q "create extension if not exists postgis" >/dev/null
+          echo "postgis: $(q "select extversion from pg_extension where extname = 'postgis'")"
+
+          test "$(q "show ssl")" = "on"
+          docker exec smoke test -f /var/lib/postgresql/data/certs/server.crt
+          docker exec smoke openssl x509 -noout -checkend 0 \
+            -in /var/lib/postgresql/data/certs/server.crt
+          echo "ssl on, certificate present and unexpired"
+
+      - name: Container logs
+        if: failure()
+        run: docker logs smoke
+
+      - name: Publish
+        if: github.event_name != 'pull_request'
+        run: docker push "ghcr.io/${{ github.repository }}:${{ steps.extract_version.outputs.version }}"
