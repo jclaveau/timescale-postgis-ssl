@@ -230,7 +230,9 @@ jobs:
           on() { docker exec -e PGPASSWORD=smoke "$1" psql -h 127.0.0.1 -U postgres -X -tAc "$2"; }
 
           run_pg old previous:test
-          echo "seeded on $(on old "select current_setting('server_version')")"
+          glibc_of() { docker exec "$1" ldd --version | awk 'NR==1 {print $NF}'; }
+          old_glibc=$(glibc_of old)
+          echo "seeded on $(on old "select current_setting('server_version')") / glibc $old_glibc"
           on old "create extension if not exists timescaledb" >/dev/null
           on old "create table readings (at timestamptz not null, value double precision)" >/dev/null
           on old "select create_hypertable('readings', 'at')" >/dev/null
@@ -240,11 +242,21 @@ jobs:
           docker stop -t 60 old >/dev/null && docker rm old >/dev/null
 
           run_pg new "$IMAGE"
-          echo "upgraded to $(on new "select current_setting('server_version')")"
+          new_glibc=$(glibc_of new)
+          echo "upgraded to $(on new "select current_setting('server_version')") / glibc $new_glibc"
 
           # Must hold: the new binary adopts the old data directory intact.
           test "$(on new "select count(*) from readings")" = "$seeded"
           echo "row count preserved: $seeded"
+
+          # glibc owns libc collation order, and pg_upgrade-style adoption keeps indexes
+          # byte for byte — a changed sort order corrupts them silently, so refuse it.
+          if [ "$old_glibc" != "$new_glibc" ]; then
+            echo "glibc moved $old_glibc -> $new_glibc: text index collation may have changed."
+            echo "This bump needs a REINDEX and must not land unattended."
+            exit 1
+          fi
+          echo "glibc unchanged at $new_glibc, collation order stable"
 
           # Reported, not enforced: a catalog/library disagreement decides automerge safety.
           if on new "select count(*) from timescaledb_information.hypertables" >/dev/null 2>&1; then

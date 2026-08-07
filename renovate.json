@@ -14,6 +14,13 @@
       "matchPackageNames": ["timescale/timescaledb-ha"],
       "matchUpdateTypes": ["major"],
       "enabled": false
+    },
+    {
+      "description": "What is left is PostgreSQL and TimescaleDB patch releases. The upgrade test starts the previous release, seeds a hypertable, and asserts the new image adopts that data directory with glibc unchanged, so these can land unattended.",
+      "matchDatasources": ["docker"],
+      "matchPackageNames": ["timescale/timescaledb-ha"],
+      "automerge": true,
+      "platformAutomerge": false
     }
   ]
 }
