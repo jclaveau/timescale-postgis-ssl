@@ -22,6 +22,7 @@ jobs:
       id-token: write
 
     strategy:
+      fail-fast: false
       matrix:
         dockerfile:
           [
@@ -88,13 +89,17 @@ jobs:
             -e PGDATA=/var/lib/postgresql/data/pgdata \
             "$IMAGE"
 
+          # docker-entrypoint.sh runs initdb.d against a temporary server bound to the
+          # unix socket only (listen_addresses=''), then shuts it down and starts the
+          # real one. Polling TCP skips that phase; polling the socket races the
+          # shutdown.
           for _ in $(seq 1 90); do
-            docker exec smoke pg_isready -U postgres -q 2>/dev/null && break
+            docker exec smoke pg_isready -h 127.0.0.1 -U postgres -q 2>/dev/null && break
             sleep 2
           done
-          docker exec smoke pg_isready -U postgres
+          docker exec smoke pg_isready -h 127.0.0.1 -U postgres
 
-          q() { docker exec smoke psql -U postgres -X -tAc "$1"; }
+          q() { docker exec -e PGPASSWORD=smoke smoke psql -h 127.0.0.1 -U postgres -X -tAc "$1"; }
 
           actual_pg=$(q "select current_setting('server_version_num')::int / 10000")
           echo "postgres major: $actual_pg (expected $expected_pg)"
