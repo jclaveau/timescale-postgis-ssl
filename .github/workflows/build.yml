@@ -117,6 +117,15 @@ jobs:
           q "create extension if not exists postgis" >/dev/null
           echo "postgis: $(q "select extversion from pg_extension where extname = 'postgis'")"
 
+          q "create extension if not exists pgfincore" >/dev/null
+          q "create table fincore_probe as select generate_series(1, 100000) as n" >/dev/null
+          # DONTNEED leaves dirty pages alone, so the freshly written table is flushed first
+          q "checkpoint" >/dev/null
+          test "$(q "select rel_os_pages > 0 and pages_mem > 0 from pgfincore('fincore_probe')")" = "t"
+          q "select pgfadvise_dontneed('fincore_probe')" >/dev/null
+          test "$(q "select pages_mem from pgfincore('fincore_probe')")" = "0"
+          echo "pgfincore: $(q "select extversion from pg_extension where extname = 'pgfincore'"), eviction works"
+
           test "$(q "show ssl")" = "on"
           docker exec smoke test -f /var/lib/postgresql/data/certs/server.crt
           docker exec smoke openssl x509 -noout -checkend 0 \
