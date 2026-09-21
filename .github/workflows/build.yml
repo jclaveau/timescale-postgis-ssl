@@ -126,6 +126,23 @@ jobs:
           test "$(q "select pages_mem from pgfincore('fincore_probe')")" = "0"
           echo "pgfincore: $(q "select extversion from pg_extension where extname = 'pgfincore'"), eviction works"
 
+          # pg_repack comes with the timescaledb-ha base (pgdg postgresql-<major>-repack,
+          # client and extension from the one package); this pins that it keeps shipping,
+          # being the only online path to compact a bloated table on Railway (#8).
+          q "create extension if not exists pg_repack" >/dev/null
+          q "create table repack_probe (id serial primary key, filler text)" >/dev/null
+          q "insert into repack_probe (filler) select repeat('x', 200) from generate_series(1, 50000)" >/dev/null
+          # Rewriting every row leaves half the heap dead; VACUUM frees the space for
+          # reuse but hands no page back, which is exactly what pg_repack is for.
+          q "update repack_probe set filler = filler" >/dev/null
+          q "vacuum repack_probe" >/dev/null
+          before=$(q "select pg_relation_size('repack_probe')")
+          docker exec -e PGPASSWORD=smoke smoke pg_repack -h 127.0.0.1 -U postgres -d postgres -t repack_probe
+          after=$(q "select pg_relation_size('repack_probe')")
+          echo "pg_repack: $(q "select extversion from pg_extension where extname = 'pg_repack'"), $before -> $after bytes"
+          test "$after" -lt "$before"
+          test "$(q "select count(*) from repack_probe")" = "50000"
+
           test "$(q "show ssl")" = "on"
           docker exec smoke test -f /var/lib/postgresql/data/certs/server.crt
           docker exec smoke openssl x509 -noout -checkend 0 \
