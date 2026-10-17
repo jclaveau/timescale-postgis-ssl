@@ -59,6 +59,13 @@ RUN cd /usr/local/lib/postgresql \
   && ls timescaledb--*.sql | grep -vx "timescaledb--${TS_VERSION}.sql" \
     | xargs -r rm -f
 
+# Both suites run against the published image over the network rather than
+# against this tree, so this stage only has to carry the test runner out. The
+# pg_regress binary and pg_textsearch's own test/ directory already sit in the
+# `textsearch` stage, which CI builds with --target.
+FROM toolkit AS toolkit-tests
+RUN cargo build --release --manifest-path /src/tools/sql-doctester/Cargo.toml
+
 # a deletion in a derived layer still ships the bytes it deleted, so the prune
 # above only pays off once the whole tree is re-exported as a single layer
 FROM scratch

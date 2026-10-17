@@ -288,6 +288,69 @@ jobs:
             echo "search_path leaks between clients, as expected before PG18"
           fi
 
+      - name: pg_textsearch regression suite
+        if: matrix.flavour == 'alpine'
+        env:
+          DOCKERFILE: ${{ matrix.dockerfile }}
+        run: |
+          set -euo pipefail
+
+          # The 70 tests pg_textsearch ships, run over the network against the image
+          # this job built, so they exercise the musl build it publishes rather than
+          # a build made for the occasion. The sources and pg_regress are already in
+          # the `textsearch` stage; --load is what puts it in the docker image store.
+          docker build --load --target textsearch -f "$DOCKERFILE" -t textsearch-tests .
+
+          # Each test file creates the extension itself, and `abort` fails when it is
+          # already there, so the database is handed over empty.
+          docker exec -e PGPASSWORD=smoke smoke psql -h 127.0.0.1 -U postgres -X -q \
+            -c 'create database contrib_regression'
+
+          cat >"$RUNNER_TEMP/regress.sh" <<'SH'
+          set -eu
+          cd /src
+          # `coverage` expects an unlimited ORDER BY through a bm25 index to return
+          # every row of the table and gets one back. The glibc build of 1.3.0 in
+          # timescaledb-ha fails it identically, so the expected file is upstream's
+          # problem and not this image's.
+          tests=$(sed -n 's/^REGRESS = //p' Makefile | tr ' ' '\n' | grep -vx coverage)
+          if ! /usr/local/lib/postgresql/pgxs/src/test/regress/pg_regress \
+            --use-existing --host=postgres --port=5432 --user=postgres \
+            --dbname=contrib_regression --inputdir=test --outputdir=test $tests
+          then
+            cat test/regression.diffs
+            exit 1
+          fi
+          SH
+          docker run --rm --network smokenet -e PGPASSWORD=smoke \
+            -v "$RUNNER_TEMP/regress.sh:/regress.sh:ro" textsearch-tests sh /regress.sh
+
+      - name: timescaledb_toolkit doc examples
+        if: matrix.flavour == 'alpine'
+        env:
+          DOCKERFILE: ${{ matrix.dockerfile }}
+        run: |
+          set -euo pipefail
+
+          # sql-doctester runs every SQL example in the toolkit's own docs and diffs
+          # the output. That is the check a musl build needs most: those examples are
+          # the approximation aggregates, printed to 14 decimals.
+          docker build --load --target toolkit-tests -f "$DOCKERFILE" -t toolkit-tests .
+
+          # It creates a database per doc file and runs CREATE EXTENSION itself, so
+          # the extension template1 arrives with has to go first.
+          docker exec -e PGPASSWORD=smoke smoke psql -h 127.0.0.1 -U postgres -X -q \
+            -d template1 -c 'drop extension timescaledb'
+
+          # asap_smooth returns different bucket timestamps than its doc prints, with
+          # the values matching to the last decimal, and the glibc build of 1.25.0 in
+          # timescaledb-ha does the same, so that one file is left out.
+          docker run --rm --network smokenet toolkit-tests sh -euc '
+          mkdir /docs && cp /src/docs/*.md /docs && rm /docs/asap.md
+          /src/target/release/sql-doctester -h postgres -p 5432 -u postgres \
+            -a smoke -d postgres /docs
+          '
+
       # Skipped for the alpine line: it drops the TimescaleDB upgrade scripts and
       # ships an unversioned toolkit library, so it can only ever initialise an
       # empty PGDATA — which is all a CI database is.

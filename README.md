@@ -49,3 +49,11 @@ certificate init, the `wrapper.sh` `PGHOST` unset, Patroni and pgBackRest. It
 also keeps only the running TimescaleDB version's libraries and upgrade scripts,
 so it can initialise an empty data directory and nothing else — which is all a
 CI database ever is. **Do not point a persistent volume at it.**
+
+Beyond the smoke test, the alpine job runs the two extensions' own suites
+against the image it just built: pg_textsearch's 70-test `pg_regress` suite and
+`sql-doctester` over `timescaledb_toolkit`'s docs, whose examples print the
+approximation aggregates to 14 decimals. That is the check a musl build needs.
+Two cases are skipped, `coverage` and `asap.md`, because the glibc builds in
+`timescale/timescaledb-ha` fail them identically — the expected outputs are
+stale upstream, not wrong here.
