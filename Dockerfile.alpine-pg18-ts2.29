@@ -1,0 +1,77 @@
+# syntax=docker/dockerfile:1
+
+# The Alpine line: `timescale/timescaledb` instead of `timescale/timescaledb-ha`,
+# 129MB compressed against the HA image's 649MB, carrying the same extensions the
+# HA image installs (TimescaleDB TSL, timescaledb_toolkit, pg_textsearch) at the
+# same versions. No PostGIS, no SSL init and no Patroni/pgBackRest: this one is
+# built for test databases, which are created empty and thrown away.
+#
+# The two extensions the base lacks are compiled here against musl, so they are
+# NOT the binaries timescaledb-ha ships — a production database belongs on an
+# image from the pgMAJOR-tsLINE line, not on this one.
+
+ARG BASE=timescale/timescaledb:2.29.2-pg18
+
+FROM ${BASE} AS build-base
+RUN apk add --no-cache build-base clang21 clang21-dev llvm21-dev git \
+  openssl-dev icu-dev readline-dev zlib-dev flex bison binutils
+ENV PG_CONFIG=/usr/local/bin/pg_config
+
+FROM build-base AS textsearch
+ARG TEXTSEARCH_VERSION=1.3.0
+RUN git clone --depth 1 -b "v${TEXTSEARCH_VERSION}" \
+  https://github.com/timescale/pg_textsearch.git /src
+WORKDIR /src
+RUN make -j"$(nproc)" && make DESTDIR=/out install \
+  && find /out -name '*.so' -exec strip --strip-unneeded {} +
+
+FROM build-base AS toolkit
+ARG TOOLKIT_VERSION=1.25.0
+ARG PGRX_VERSION=0.18.1
+# rustfmt is not optional: pgrx generates pg18.rs and then shells out to it, so
+# the build dies three minutes in without it
+RUN apk add --no-cache cargo rust rustfmt
+ENV CARGO_HOME=/cargo PATH=/cargo/bin:$PATH
+RUN cargo install cargo-pgrx --version "${PGRX_VERSION}" --locked
+RUN git clone --depth 1 -b "${TOOLKIT_VERSION}" \
+  https://github.com/timescale/timescaledb-toolkit.git /src
+WORKDIR /src/extension
+RUN cargo pgrx init "--pg18=${PG_CONFIG}"
+# the unstripped cdylib is 182MB of debug symbols against 14MB of code
+RUN cargo pgrx package --pg-config "${PG_CONFIG}" --out-dir /out \
+  && find /out -name '*.so' -exec strip --strip-unneeded {} +
+
+FROM ${BASE} AS pruned
+ARG TS_VERSION=2.29.2
+# the base is busybox-only, while psql scripts run through `bash` and colour
+# their output with `tput`
+RUN apk add --no-cache bash ncurses
+COPY --from=textsearch /out/usr/local/ /usr/local/
+COPY --from=toolkit /out/usr/local/ /usr/local/
+# the base ships every TimescaleDB release back to 2.23 so an existing data
+# directory can be upgraded in place; a test database starts at ${TS_VERSION}.
+# timescaledb.so itself stays: it is the loader shared_preload_libraries names,
+# and initdb refuses to start without it.
+RUN cd /usr/local/lib/postgresql \
+  && ls timescaledb-*.so | grep -v -- "-${TS_VERSION}.so" | xargs -r rm -f \
+  && rm -rf bitcode \
+  && cd /usr/local/share/postgresql/extension \
+  && ls timescaledb--*.sql | grep -vx "timescaledb--${TS_VERSION}.sql" \
+    | xargs -r rm -f
+
+# a deletion in a derived layer still ships the bytes it deleted, so the prune
+# above only pays off once the whole tree is re-exported as a single layer
+FROM scratch
+COPY --from=pruned / /
+ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+  GOSU_VERSION=1.19 \
+  LANG=en_US.utf8 \
+  PG_MAJOR=18 \
+  PG_VERSION=18.6 \
+  PGDATA=/var/lib/postgresql/18/docker
+VOLUME /var/lib/postgresql
+WORKDIR /
+EXPOSE 5432
+STOPSIGNAL SIGINT
+ENTRYPOINT ["docker-entrypoint.sh"]
+CMD ["postgres"]

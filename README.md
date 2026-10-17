@@ -28,3 +28,24 @@ By default, the cert expiry is set to 820 days.  You can control this by configu
 ### A note about running the images locally
 
 The images built from this repo and workflow do not contain support for ARM.  Check out the Dockerfiles that build them and feel free to copy the logic to build your own image with the appropriate base containing support for ARM.
+### The alpine line, for CI
+
+`Dockerfile.alpine-pg18-ts2.29` builds a second, unrelated package:
+`ghcr.io/jclaveau/timescaledb-alpine:pg18-ts2.29`. The name says alpine because
+the tag only ever says which PostgreSQL and which TimescaleDB an image carries,
+and nothing about which libc built it.
+
+It exists to make a CI job's image pull cheap: 129MB compressed against the
+649MB of the `timescaledb-ha` line, which is ~7s instead of ~31s per job.
+
+It starts from `timescale/timescaledb` (alpine, musl) and **compiles**
+`timescaledb_toolkit` and `pg_textsearch` from source, because the `.so` files
+the HA image ships link `libc.so.6` and cannot be copied onto musl. So it offers
+the same extension set a database created from a production dump needs, built
+from different binaries.
+
+What it does not have, because nothing in CI asks for it: PostGIS, the SSL
+certificate init, the `wrapper.sh` `PGHOST` unset, Patroni and pgBackRest. It
+also keeps only the running TimescaleDB version's libraries and upgrade scripts,
+so it can initialise an empty data directory and nothing else — which is all a
+CI database ever is. **Do not point a persistent volume at it.**

@@ -24,16 +24,21 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        dockerfile:
-          [
-            "Dockerfile.pg13-ts2.15",
-            "Dockerfile.pg14-ts2.19",
-            "Dockerfile.pg15-ts2.28",
-            "Dockerfile.pg16-ts2.29",
-            "Dockerfile.pg17-ts2.29",
-            "Dockerfile.pg18-ts2.28",
-            "Dockerfile.pg18-ts2.29",
-          ]
+        include:
+          - dockerfile: "Dockerfile.pg13-ts2.15"
+          - dockerfile: "Dockerfile.pg14-ts2.19"
+          - dockerfile: "Dockerfile.pg15-ts2.28"
+          - dockerfile: "Dockerfile.pg16-ts2.29"
+          - dockerfile: "Dockerfile.pg17-ts2.29"
+          - dockerfile: "Dockerfile.pg18-ts2.28"
+          - dockerfile: "Dockerfile.pg18-ts2.29"
+          # Alpine + musl with the extensions compiled in: its own package, since
+          # the tag says which PostgreSQL and TimescaleDB an image carries and
+          # nothing about which libc built it
+          - dockerfile: "Dockerfile.alpine-pg18-ts2.29"
+            image: "timescaledb-alpine"
+            tag: "pg18-ts2.29"
+            flavour: "alpine"
 
     steps:
       - name: Checkout sources
@@ -55,12 +60,21 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract version from Dockerfile name
-        id: extract_version
+      - name: Resolve the image reference
+        id: image
+        env:
+          DOCKERFILE: ${{ matrix.dockerfile }}
+          IMAGE: ${{ matrix.image }}
+          TAG: ${{ matrix.tag }}
         run: |
-          version="${{ matrix.dockerfile }}"
-          version="${version#Dockerfile.}" # Remove "Dockerfile." prefix if it exists
-          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          # The Dockerfile name carries the tag, and the package name defaults to
+          # the repository, so a line that ships something else than the base
+          # pgMAJOR-tsLINE image states both in the matrix instead.
+          tag="${TAG:-${DOCKERFILE#Dockerfile.}}"
+          name="${IMAGE:-${GITHUB_REPOSITORY#*/}}"
+          echo "ref=ghcr.io/${GITHUB_REPOSITORY_OWNER}/${name}:${tag}" >> "$GITHUB_OUTPUT"
+          echo "version=${tag}" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Build
@@ -70,12 +84,13 @@ jobs:
           platforms: linux/amd64
           load: true
           push: false
-          tags: ghcr.io/${{ github.repository }}:${{ steps.extract_version.outputs.version }}
+          tags: ${{ steps.image.outputs.ref }}
 
       - name: Smoke test
         env:
-          IMAGE: ghcr.io/${{ github.repository }}:${{ steps.extract_version.outputs.version }}
-          VERSION: ${{ steps.extract_version.outputs.version }}
+          IMAGE: ${{ steps.image.outputs.ref }}
+          VERSION: ${{ steps.image.outputs.version }}
+          FLAVOUR: ${{ matrix.flavour || 'ha' }}
         run: |
           set -euo pipefail
 
@@ -84,12 +99,20 @@ jobs:
 
           docker network create smokenet
 
+          # pg_textsearch registers its access method from shared_preload_libraries, so
+          # the alpine line is started the way the planner starts it. The HA line keeps
+          # its own command: wrapper.sh pins the port and runs init-ssl.sh.
+          command=()
+          if [ "$FLAVOUR" = alpine ]; then
+            command=(postgres -c shared_preload_libraries=timescaledb,pg_textsearch)
+          fi
+
           # PGDATA is mandatory: wrapper.sh exits 1 without it. Same path Railway mounts,
           # so init-ssl.sh writes its certs beside the data directory as it does in prod.
           docker run -d --name smoke --network smokenet --network-alias postgres \
             -e POSTGRES_PASSWORD=smoke \
             -e PGDATA=/var/lib/postgresql/data/pgdata \
-            "$IMAGE"
+            "$IMAGE" "${command[@]}"
 
           # docker-entrypoint.sh runs initdb.d against a temporary server bound to the
           # unix socket only (listen_addresses=''), then shuts it down and starts the
@@ -114,23 +137,48 @@ jobs:
           echo "timescaledb: $actual_ts (expected ${expected_ts}.x)"
           case "$actual_ts" in "${expected_ts}."*) ;; *) exit 1 ;; esac
 
-          q "create extension if not exists postgis" >/dev/null
-          echo "postgis: $(q "select extversion from pg_extension where extname = 'postgis'")"
+          if [ "$FLAVOUR" = alpine ]; then
+            # Both extensions are compiled against musl in this Dockerfile instead of
+            # coming prebuilt with the base, so running them is the whole assertion.
+            q "create extension if not exists timescaledb_toolkit" >/dev/null
+            echo "timescaledb_toolkit: $(q "select extversion from pg_extension where extname = 'timescaledb_toolkit'")"
+            test "$(q "select approx_percentile(0.5, percentile_agg(n)) > 0 from generate_series(1, 100) n")" = "t"
 
-          q "create extension if not exists pgfincore" >/dev/null
-          q "create table fincore_probe as select generate_series(1, 100000) as n" >/dev/null
-          # DONTNEED leaves dirty pages alone, so the freshly written table is flushed first
-          q "checkpoint" >/dev/null
-          test "$(q "select rel_os_pages > 0 and pages_mem > 0 from pgfincore('fincore_probe')")" = "t"
-          q "select pgfadvise_dontneed('fincore_probe')" >/dev/null
-          test "$(q "select pages_mem from pgfincore('fincore_probe')")" = "0"
-          echo "pgfincore: $(q "select extversion from pg_extension where extname = 'pgfincore'"), eviction works"
+            q "create extension if not exists pg_textsearch" >/dev/null
+            echo "pg_textsearch: $(q "select extversion from pg_extension where extname = 'pg_textsearch'")"
+            q "create table bm25_probe (body text)" >/dev/null
+            q "insert into bm25_probe values ('the quick brown fox'), ('lorem ipsum dolor')" >/dev/null
+            q "create index on bm25_probe using bm25 (body) with (text_config = 'english')" >/dev/null
+            test "$(q "select body from bm25_probe order by body <@> to_bm25query('fox', 'bm25_probe_body_idx') limit 1")" \
+              = "the quick brown fox"
+            echo "bm25 index ranks the matching row first"
 
-          test "$(q "show ssl")" = "on"
-          docker exec smoke test -f /var/lib/postgresql/data/certs/server.crt
-          docker exec smoke openssl x509 -noout -checkend 0 \
-            -in /var/lib/postgresql/data/certs/server.crt
-          echo "ssl on, certificate present and unexpired"
+            # TSL, not -oss: the planner's cache migrations compress chunks.
+            q "create table tsl_probe (at timestamptz not null, value double precision)" >/dev/null
+            q "select create_hypertable('tsl_probe', 'at')" >/dev/null
+            q "insert into tsl_probe select now() - (g || ' minutes')::interval, g from generate_series(1, 100) g" >/dev/null
+            q "alter table tsl_probe set (timescaledb.compress)" >/dev/null
+            q "select compress_chunk(c) from show_chunks('tsl_probe') c" >/dev/null
+            echo "TSL build: chunk compression works"
+          else
+            q "create extension if not exists postgis" >/dev/null
+            echo "postgis: $(q "select extversion from pg_extension where extname = 'postgis'")"
+
+            q "create extension if not exists pgfincore" >/dev/null
+            q "create table fincore_probe as select generate_series(1, 100000) as n" >/dev/null
+            # DONTNEED leaves dirty pages alone, so the freshly written table is flushed first
+            q "checkpoint" >/dev/null
+            test "$(q "select rel_os_pages > 0 and pages_mem > 0 from pgfincore('fincore_probe')")" = "t"
+            q "select pgfadvise_dontneed('fincore_probe')" >/dev/null
+            test "$(q "select pages_mem from pgfincore('fincore_probe')")" = "0"
+            echo "pgfincore: $(q "select extversion from pg_extension where extname = 'pgfincore'"), eviction works"
+
+            test "$(q "show ssl")" = "on"
+            docker exec smoke test -f /var/lib/postgresql/data/certs/server.crt
+            docker exec smoke openssl x509 -noout -checkend 0 \
+              -in /var/lib/postgresql/data/certs/server.crt
+            echo "ssl on, certificate present and unexpired"
+          fi
 
       - name: PgBouncer round-trip
         run: |
@@ -165,7 +213,7 @@ jobs:
 
       - name: Pooled search_path handover
         env:
-          VERSION: ${{ steps.extract_version.outputs.version }}
+          VERSION: ${{ steps.image.outputs.version }}
         run: |
           set -euo pipefail
 
@@ -240,8 +288,12 @@ jobs:
             echo "search_path leaks between clients, as expected before PG18"
           fi
 
+      # Skipped for the alpine line: it drops the TimescaleDB upgrade scripts and
+      # ships an unversioned toolkit library, so it can only ever initialise an
+      # empty PGDATA — which is all a CI database is.
       - name: Resolve the previous release in this line
         id: prev
+        if: matrix.flavour != 'alpine'
         env:
           DOCKERFILE: ${{ matrix.dockerfile }}
         run: |
@@ -284,7 +336,7 @@ jobs:
       - name: Upgrade test
         if: steps.prev.outputs.tag != ''
         env:
-          IMAGE: ghcr.io/${{ github.repository }}:${{ steps.extract_version.outputs.version }}
+          IMAGE: ${{ steps.image.outputs.ref }}
           DOCKERFILE: ${{ matrix.dockerfile }}
           PREV: ${{ steps.prev.outputs.tag }}
         run: |
@@ -362,4 +414,4 @@ jobs:
 
       - name: Publish
         if: github.event_name != 'pull_request'
-        run: docker push "ghcr.io/${{ github.repository }}:${{ steps.extract_version.outputs.version }}"
+        run: docker push "${{ steps.image.outputs.ref }}"

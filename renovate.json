@@ -16,6 +16,26 @@
       "enabled": false
     },
     {
+      "description": "The alpine base tags read tsLINE.PATCH-pgMAJOR, so the fields swap places: capturing the PostgreSQL major as `compatibility` is what stops Renovate crossing it, and a TimescaleDB line change is a new Dockerfile here too.",
+      "matchDatasources": ["docker"],
+      "matchPackageNames": ["timescale/timescaledb"],
+      "versioning": "regex:^(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)-pg(?<compatibility>\\d+)$"
+    },
+    {
+      "description": "A TimescaleDB line bump is a new Dockerfile and a new tag, and it would also need the pinned pg_textsearch and toolkit releases revisited.",
+      "matchDatasources": ["docker"],
+      "matchPackageNames": ["timescale/timescaledb"],
+      "matchUpdateTypes": ["major", "minor"],
+      "enabled": false
+    },
+    {
+      "description": "TimescaleDB patch releases of the alpine base. No upgrade test runs on this line — it only ever initialises an empty data directory — so the smoke test building and running both compiled extensions is the gate.",
+      "matchDatasources": ["docker"],
+      "matchPackageNames": ["timescale/timescaledb"],
+      "automerge": true,
+      "platformAutomerge": false
+    },
+    {
       "description": "What is left is PostgreSQL and TimescaleDB patch releases. The upgrade test starts the previous release, seeds a hypertable, and asserts the new image adopts that data directory with glibc unchanged, so these can land unattended.",
       "matchDatasources": ["docker"],
       "matchPackageNames": ["timescale/timescaledb-ha"],
