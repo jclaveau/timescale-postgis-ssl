@@ -39,16 +39,24 @@ It exists to make a CI job's image pull cheap: 129MB compressed against the
 649MB of the `timescaledb-ha` line, which is ~7s instead of ~31s per job.
 
 It starts from `timescale/timescaledb` (alpine, musl) and **compiles**
-`timescaledb_toolkit` and `pg_textsearch` from source, because the `.so` files
-the HA image ships link `libc.so.6` and cannot be copied onto musl. So it offers
-the same extension set a database created from a production dump needs, built
-from different binaries.
+`timescaledb_toolkit`, `pg_textsearch` and `pgfincore` from source, because the
+`.so` files the HA image ships link `libc.so.6` and cannot be copied onto musl.
+Each is pinned to the version the HA line installs, `pgfincore` to the 1.4.0
+that pgdg ships as `postgresql-18-pgfincore`. So it offers the same extension set
+a database created from a production dump needs, built from different binaries.
 
 What it does not have, because nothing in CI asks for it: PostGIS, the SSL
 certificate init, the `wrapper.sh` `PGHOST` unset, Patroni and pgBackRest. It
 also keeps only the running TimescaleDB version's libraries and upgrade scripts,
 so it can initialise an empty data directory and nothing else — which is all a
 CI database ever is. **Do not point a persistent volume at it.**
+
+PostGIS is the one deliberate gap rather than an oversight: alpine packages it
+only against its own `/usr` PostgreSQL, so `apk add postgis` drags a second
+complete `postgresql18` in beside the image's `/usr/local` build and takes it
+from 329MB to 597MB unpacked — which spends the entire reason this line exists.
+Nothing in the planner runs `CREATE EXTENSION postgis`, so the HA line keeps
+that assertion.
 
 Beyond the smoke test, the alpine job runs the two extensions' own suites
 against the image it just built: pg_textsearch's 70-test `pg_regress` suite and
