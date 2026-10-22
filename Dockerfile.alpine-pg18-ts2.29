@@ -103,18 +103,37 @@ RUN cd /usr/local/share/postgresql/extension \
 # Scope is the PostgreSQL suite, not the whole filesystem: busybox backs
 # /bin/sh and 215 other names, so patching it would put the entrypoint at
 # risk for allocations that cost nothing.
+#
+# Within that suite the Go binaries are skipped, and the loop counts what it
+# skips so a silent miss cannot pass for a patch. gosu and timescaledb-tune
+# are static and have no DT_NEEDED list to prepend to, which patchelf reports
+# by failing; timescaledb-parallel-copy is dynamic and accepts the entry, then
+# segfaults on `--help`, because the Go runtime allocates through its own
+# machinery and will not take a foreign malloc underneath it. The published
+# pg18-ts2.29 shipped that crash for one build (digest
+# sha256:7ae21faa4fb46278edee1971841b0cd3ba61a303210f1e83726f007593065a99),
+# so the `--help` call below is a build-time guard, not decoration.
 RUN apk add --no-cache mimalloc2-insecure \
   && apk add --no-cache --virtual .patchelf patchelf \
   && patched=0 \
+  && skipped=0 \
   && for b in /usr/local/bin/*; do \
        [ -f "$b" ] || continue; \
        head -c4 "$b" | grep -q ELF || continue; \
+       if grep -q go.buildid "$b" \
+          || ! patchelf --print-needed "$b" \
+               | grep -qx libc.musl-x86_64.so.1; then \
+         skipped=$((skipped + 1)); \
+         continue; \
+       fi; \
        patchelf --add-needed libmimalloc-insecure.so.2 "$b"; \
        patched=$((patched + 1)); \
      done \
+  && echo "mimalloc: patched $patched, skipped $skipped" \
   && test "$patched" -ge 30 \
   && patchelf --print-needed /usr/local/bin/postgres | head -1 \
      | grep -qx libmimalloc-insecure.so.2 \
+  && timescaledb-parallel-copy --help > /dev/null \
   && apk del .patchelf
 
 # Both suites run against the published image over the network rather than
