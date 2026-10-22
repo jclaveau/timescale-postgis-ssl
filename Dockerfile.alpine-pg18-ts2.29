@@ -75,6 +75,48 @@ RUN cd /usr/local/share/postgresql/extension \
   && ls timescaledb-*.so | grep -v -- "-${ts}.so" | xargs -r rm -f \
   && rm -rf bitcode
 
+# mimalloc instead of musl's mallocng. mallocng maps ~64 KiB blocks straight
+# from the kernel and hands them back on free: over a seed import plus a
+# 2M-row hypertable workload that is 107,016 munmap calls under mallocng
+# against 22 under mimalloc. A/B of this image against the unpatched one, 4
+# reps alternating order, cgroup usage_usec, every pair mallocng vs mimalloc:
+# seed import 1365 vs 775 ms (1.76x), compress_chunk 2583 vs 1437 ms (1.80x),
+# whole workload 13956 vs 11936 ms (1.17x), all three spreads disjoint. The
+# 2M-row INSERT (9240 vs 8852 ms) and the time_bucket aggregate (888 vs 750)
+# stay inside the noise. Each rep greps the postmaster's /proc/1/maps and
+# refuses to compare when the library did not load, because a musl-vs-musl
+# run reads as a null result rather than as a broken one. See
+# https://github.com/the-HipHipHip/Planner/pull/821.
+#
+# Linked in as a DT_NEEDED entry rather than preloaded, for two reasons.
+# `ENV LD_PRELOAD` does not survive the entrypoint's `exec gosu postgres`,
+# which is a setuid exec and therefore drops the variable; and musl has no
+# /etc/ld.so.preload, so the environment is the only other mechanism it
+# offers. patchelf prepends the entry, which is what makes it win `malloc`:
+# musl resolves a symbol by walking the load order, and libc.musl is the last
+# DT_NEEDED on every one of these binaries.
+#
+# -insecure omits the guard pages and the free-list encoding. That is
+# acceptable HERE and nowhere else: this image is built for throwaway test
+# databases, is consumed only by CI, and must never back a real one.
+#
+# Scope is the PostgreSQL suite, not the whole filesystem: busybox backs
+# /bin/sh and 215 other names, so patching it would put the entrypoint at
+# risk for allocations that cost nothing.
+RUN apk add --no-cache mimalloc2-insecure \
+  && apk add --no-cache --virtual .patchelf patchelf \
+  && patched=0 \
+  && for b in /usr/local/bin/*; do \
+       [ -f "$b" ] || continue; \
+       head -c4 "$b" | grep -q ELF || continue; \
+       patchelf --add-needed libmimalloc-insecure.so.2 "$b"; \
+       patched=$((patched + 1)); \
+     done \
+  && test "$patched" -ge 30 \
+  && patchelf --print-needed /usr/local/bin/postgres | head -1 \
+     | grep -qx libmimalloc-insecure.so.2 \
+  && apk del .patchelf
+
 # Both suites run against the published image over the network rather than
 # against this tree, so this stage only has to carry the test runner out. The
 # pg_regress binary and pg_textsearch's own test/ directory already sit in the
