@@ -2,6 +2,14 @@ name: Docker Image CI/CD for timescale + postgis image
 
 on:
   workflow_dispatch:
+    inputs:
+      dockerfile:
+        description: >-
+          Publish only the image built from this Dockerfile. Left empty, every
+          tag in the matrix is republished, the seven the Railway prod and dev
+          databases pull included, so name one when a single image changed.
+        type: string
+        default: ""
   pull_request:
     paths:
       - "Dockerfile.*"
@@ -478,5 +486,8 @@ jobs:
           done
 
       - name: Publish
-        if: github.event_name != 'pull_request'
+        if: >-
+          github.event_name != 'pull_request'
+          && (inputs.dockerfile == ''
+              || inputs.dockerfile == matrix.dockerfile)
         run: docker push "${{ steps.image.outputs.ref }}"
